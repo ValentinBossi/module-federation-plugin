@@ -1,8 +1,5 @@
 import { BuilderContext } from '@angular-devkit/architect';
-import {
-  logger,
-  NormalizedFederationConfig,
-} from '@softarc/native-federation/build';
+import { logger } from '@softarc/native-federation/build';
 import { execSync } from 'child_process';
 import path from 'path';
 import fs from 'fs';
@@ -136,163 +133,69 @@ function ensureDistFolders(locales: string[], outputPath: string) {
   }
 }
 
-const LOCALE_DATA_BASE_MODULE = '@angular/common/locales/global';
-
 // Angular's framework ships `en`/`en-US` data inline; the locale-data plugin
-// short-circuits these and never emits a bare specifier for them.
+// short-circuits these and never emits a locale-data import for them.
 // See: @angular/build/src/tools/esbuild/i18n-locale-plugin.ts
 function isBuiltInEnglishLocale(code: string): boolean {
   return code === 'en' || code === 'en-US';
 }
 
-export type ResolvedLocaleData = {
-  /** Bare specifier emitted by Angular, e.g. "@angular/common/locales/global/de-CH" */
-  packageName: string;
-  /** Path to the locale data file, relative to the workspace root */
-  entryPoint: string;
-  /** The locale tag that actually matched on disk (may be a prefix of the request) */
-  matchedCode: string;
-  /** Version of @angular/common (for cache busting / packageInfo) */
-  version: string;
-};
-
 /**
- * Resolves the `@angular/common/locales/global/<code>` file on disk, mirroring
- * Angular's own progressive locale-tag fallback (de-CH → de).
+ * Determines whether Angular will inject locale data
+ * (`@angular/common/locales/global/<code>`) into the polyfills bundle: it
+ * does so for an explicitly defined non-English `i18n.sourceLocale`, or for
+ * inline locales (the dev server inlines a single locale via `--localize`).
  */
-export function resolveAngularLocaleData(
-  code: string,
-  workspaceRoot: string,
-): ResolvedLocaleData | null {
-  if (!code || isBuiltInEnglishLocale(code)) {
-    return null;
-  }
-
-  const angularCommonRoot = path.join(
-    workspaceRoot,
-    'node_modules',
-    '@angular',
-    'common',
-  );
-  let version = '0.0.0';
-  const pkgJsonPath = path.join(angularCommonRoot, 'package.json');
-  if (fs.existsSync(pkgJsonPath)) {
-    try {
-      version =
-        JSON.parse(fs.readFileSync(pkgJsonPath, 'utf-8')).version ?? version;
-    } catch {
-      // ignore – fall back to the placeholder version
-    }
-  }
-
-  let partial = code;
-  while (partial) {
-    for (const ext of ['.js', '.mjs']) {
-      const rel = path.posix.join(
-        'node_modules',
-        '@angular',
-        'common',
-        'locales',
-        'global',
-        `${partial}${ext}`,
-      );
-      const abs = path.join(workspaceRoot, rel);
-      if (fs.existsSync(abs)) {
-        return {
-          packageName: `${LOCALE_DATA_BASE_MODULE}/${partial}`,
-          entryPoint: rel,
-          matchedCode: partial,
-          version,
-        };
-      }
-    }
-
-    const parts = partial.split('-');
-    if (parts.length <= 1) {
-      break;
-    }
-    partial = parts.slice(0, -1).join('-');
-  }
-
-  return null;
-}
-
-/**
- * When Angular's `@angular/build:application` builder is configured with a
- * non-English `i18n.sourceLocale` (or runs a single inline locale via the dev
- * server), its esbuild i18n-locale-plugin emits bare external imports of the
- * form `@angular/common/locales/global/<code>` that vite's dep-prebundling is
- * expected to resolve at runtime. Native Federation replaces that resolution
- * layer with its own importmap, so the bare specifier ends up unresolved in
- * the browser.
- *
- * This helper compensates by injecting the locale data files as shared chunks
- * into the federation config *after* normalization (i.e. after `filterShared`
- * has already run), so the bundler emits them and `writeImportMap` lists
- * them.
- *
- * Returns the list of package names that were registered, primarily for
- * diagnostics and tests.
- */
-export function registerAngularLocaleDataInFederationConfig(
-  config: NormalizedFederationConfig,
+export function localeDataNeedsBundling(
   i18n: I18nConfig | undefined,
-  workspaceRoot: string,
-  inlineLocales: readonly string[] = [],
-): string[] {
+  localeFilter: boolean | string[],
+): boolean {
   if (!i18n) {
-    return [];
+    return false;
   }
+
+  const codes: string[] = [];
 
   const sourceCode =
     typeof i18n.sourceLocale === 'string'
       ? i18n.sourceLocale
       : i18n.sourceLocale?.code;
-
-  const candidates = new Set<string>();
   if (sourceCode) {
-    candidates.add(sourceCode);
-  }
-  for (const loc of inlineLocales) {
-    candidates.add(loc);
+    codes.push(sourceCode);
   }
 
-  const registered: string[] = [];
-
-  for (const code of candidates) {
-    if (isBuiltInEnglishLocale(code)) {
-      continue;
-    }
-
-    const resolved = resolveAngularLocaleData(code, workspaceRoot);
-    if (!resolved) {
-      logger.warn(
-        `Could not locate '${LOCALE_DATA_BASE_MODULE}/${code}' in node_modules. ` +
-          `The browser will not be able to resolve this bare specifier at runtime. ` +
-          `Verify that @angular/common is installed, or share the locale data manually via federation.config.js.`,
-      );
-      continue;
-    }
-
-    if (config.shared[resolved.packageName]) {
-      // User has already shared this entry explicitly – leave it alone.
-      continue;
-    }
-
-    config.shared[resolved.packageName] = {
-      singleton: true,
-      strictVersion: false,
-      requiredVersion: 'auto',
-      platform: 'browser',
-      build: 'default',
-      packageInfo: {
-        entryPoint: resolved.entryPoint,
-        version: resolved.version,
-        esm: true,
-      },
-    };
-    registered.push(resolved.packageName);
+  if (Array.isArray(localeFilter)) {
+    codes.push(...localeFilter);
   }
 
-  return registered;
+  return codes.some((code) => !isBuiltInEnglishLocale(code));
+}
+
+/**
+ * Returns the path of the no-op polyfill file that ships with this package
+ * (src/polyfills-bundle-switch.mjs), preferably relative to the workspace
+ * root.
+ *
+ * Purpose: In dev-server mode, Angular's polyfills bundle runs with
+ * `packages: 'external'`, so the locale data injected for a non-English
+ * sourceLocale stays a bare import (`@angular/common/locales/global/<code>`).
+ * Vite normally rescues such imports by prebundling them, but under Native
+ * Federation they match the `@angular/common/` prefix of the federation
+ * externals and are deliberately left bare - which crashes the natively
+ * loaded polyfills script.
+ *
+ * Angular disables external packages for the polyfills bundle as soon as one
+ * polyfill entry is a local file - a path starting with '.' or with a
+ * JS/TS extension (see getEsBuildCommonPolyfillsOptions in @angular/build).
+ * Adding this no-op entry therefore makes the dev server bundle the locale
+ * data inline - exactly like a production build.
+ */
+export function getPolyfillsBundleSwitchPath(workspaceRoot: string): string {
+  const absPath = path.join(__dirname, '..', 'polyfills-bundle-switch.mjs');
+
+  const relPath = path.relative(workspaceRoot, absPath).replace(/\\/g, '/');
+
+  // Outside the workspace (unusual hoisting): fall back to the absolute
+  // path - the .mjs extension still marks it as a local file for Angular.
+  return relPath.startsWith('..') ? absPath.replace(/\\/g, '/') : `./${relPath}`;
 }

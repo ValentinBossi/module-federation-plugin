@@ -46,7 +46,8 @@ import { FederationInfo } from '@softarc/native-federation-runtime';
 import { PluginBuild } from 'esbuild';
 import {
   getI18nConfig,
-  registerAngularLocaleDataInFederationConfig,
+  getPolyfillsBundleSwitchPath,
+  localeDataNeedsBundling,
   translateFederationArtefacts,
 } from '../../utils/i18n';
 import { RebuildHubs } from '../../utils/rebuild-events';
@@ -247,20 +248,6 @@ export async function* runBuilder(
   const config = await loadFederationConfig(fedOptions);
   logger.measure(start, 'To load the federation config.');
 
-  // When `i18n.sourceLocale` (or an inline locale) resolves to a non-English
-  // code, Angular's application builder emits bare specifiers of the form
-  // `@angular/common/locales/global/<code>` that normally rely on vite's
-  // dep-prebundling at dev time. Native Federation replaces that resolution
-  // layer, so we have to surface those locale data files through the
-  // federation's importmap explicitly.
-  const inlineLocaleFilter = Array.isArray(localeFilter) ? localeFilter : [];
-  registerAngularLocaleDataInFederationConfig(
-    config,
-    i18n,
-    context.workspaceRoot,
-    inlineLocaleFilter,
-  );
-
   const externals = getExternals(config);
   const plugins = [
     createSharedMappingsPlugin(config.sharedMappings),
@@ -388,11 +375,50 @@ export async function* runBuilder(
 
   const appBuilderName = '@angular/build:application';
 
+  // With the dev server, Angular builds the polyfills bundle with external
+  // packages (vite prebundling). The locale-data import Angular injects for a
+  // non-English sourceLocale then stays a bare specifier in the natively
+  // loaded polyfills script: it matches the '@angular/common/' prefix of the
+  // federation externals, so vite deliberately leaves it unresolved.
+  // A local polyfill entry switches Angular's polyfills bundle to
+  // packages:'bundle', which inlines the locale data - the exact behavior of
+  // a production build. See getPolyfillsBundleSwitchPath for details.
+  // Note: production builds bundle the locale data without this switch.
+  // Known exception: SSR builds set externalDependencies, which can leave the
+  // import external even in production - a separate, pre-existing limitation.
+  const polyfillsBundleSwitch =
+    runServer && localeDataNeedsBundling(i18n, localeFilter)
+      ? getPolyfillsBundleSwitchPath(context.workspaceRoot)
+      : null;
+
+  const internalAngularBuilder = createInternalAngularBuilder({
+    instrumentForCoverage,
+  });
+
+  const buildApplicationWithLocaleData = (
+    appOptions,
+    appContext,
+    pluginsOrExtensions,
+  ) => {
+    if (polyfillsBundleSwitch) {
+      const polyfills = Array.isArray(appOptions.polyfills)
+        ? appOptions.polyfills
+        : appOptions.polyfills
+          ? [appOptions.polyfills]
+          : [];
+      appOptions = {
+        ...appOptions,
+        polyfills: [...polyfills, polyfillsBundleSwitch],
+      };
+    }
+    return internalAngularBuilder(appOptions, appContext, pluginsOrExtensions);
+  };
+
   const builderRun = runServer
     ? serveWithVite(
         serverOptions,
         appBuilderName,
-        createInternalAngularBuilder({ instrumentForCoverage }),
+        buildApplicationWithLocaleData,
         context,
         nfOptions.skipHtmlTransform
           ? {}
